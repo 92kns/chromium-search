@@ -1,5 +1,7 @@
 # chromium-search
 
+> **Moved:** this fork is now part of [engine-search](https://github.com/92kns/engine-search). Use `engine-search chromium ...` or `engine-search blink ...`.
+
 An agent friendly CLI for [Chromium source code](https://source.chromium.org).
 
 A single-file Python script with zero dependencies. Talks directly to the Chromium Code Search API.
