@@ -15,6 +15,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Generator
@@ -64,6 +65,20 @@ class SearchResult:
 DEFAULT_API_KEY = "AIzaSyCqPSptx9mClE5NU4cpfzr6cgdO_phV1lM"
 BASE_API_URL = "https://grimoireoss-pa.clients6.google.com"
 
+PROJECT = os.environ.get("CR_SEARCH_PROJECT", "chromium")
+REPO = os.environ.get("CR_SEARCH_REPO", "chromium/src")
+PATH_PREFIX = ""
+
+
+def set_scope(project: str, repo: str, path_prefix: str = "") -> None:
+    global PROJECT, REPO, PATH_PREFIX
+    PROJECT, REPO = project, repo
+    PATH_PREFIX = path_prefix.strip("/") + "/" if path_prefix.strip("/") else ""
+
+
+def repository_scope() -> dict[str, Any]:
+    return {"root": {"ossProject": PROJECT, "repositoryName": REPO}}
+
 
 def random_id() -> str:
     raw = secrets.token_bytes(9)
@@ -101,13 +116,8 @@ def build_payload(
             "numberOfContextLines": 1,
             "pageSize": min(page_size, 100),
             "pageToken": page_token,
-            "pathPrefix": "",
-            "repositoryScope": {
-                "root": {
-                    "ossProject": "chromium",
-                    "repositoryName": "chromium/src",
-                },
-            },
+            "pathPrefix": PATH_PREFIX,
+            "repositoryScope": repository_scope(),
             "retrieveMultibranchResults": True,
             "savedQuery": "",
             "scoringModel": "",
@@ -159,6 +169,64 @@ def extract_json(response_text: str) -> Any:
     return json.loads(m.group(0))
 
 
+def batch_get(path_and_query: str, timeout: float = 15.0) -> dict[str, Any]:
+    """Run a GET through the same multipart /batch envelope used for search."""
+    key = os.environ.get("CR_SEARCH_API_KEY", DEFAULT_API_KEY)
+    boundary = build_boundary()
+    url = f"{BASE_API_URL}/batch?%24ct=multipart%2Fmixed%3B%20boundary%3D{boundary}"
+    body = "\r\n".join(
+        [
+            f"--{boundary}",
+            "Content-Type: application/http",
+            f"Content-ID: <response-{boundary}+gapiRequest@googleapis.com>",
+            "",
+            f"GET {path_and_query}&key={key}",
+            "X-JavaScript-User-Agent: google-api-javascript-client/1.1.0",
+            "X-Requested-With: XMLHttpRequest",
+            "",
+            f"--{boundary}--",
+            "",
+        ]
+    )
+    req = urllib.request.Request(
+        url,
+        data=body.encode(),
+        headers={
+            "Content-Type": "text/plain; charset=UTF-8",
+            "Origin": "https://source.chromium.org",
+            "Referer": "https://source.chromium.org/",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = extract_json(resp.read().decode())
+    if "error" in raw:
+        raise RuntimeError(raw["error"].get("message", "API error"))
+    return raw
+
+
+def fetch_history(path: str, ref: str, limit: int) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode(
+        {
+            "logForPath": "true",
+            "logForPathWithPagination": "true",
+            "maxLogEntries": str(limit),
+            "path": path.strip("/"),
+            "repositoryKey.ossProject": PROJECT,
+            "repositoryKey.repositoryName": REPO,
+            "starts": ref,
+        }
+    )
+    return batch_get(f"/v1/history/list?{query}").get("commitLogEntries", [])
+
+
+def fetch_repositories() -> list[dict[str, Any]]:
+    data = batch_get(
+        f"/v1/ossProjects/{urllib.parse.quote(PROJECT)}?multibranchEnabled=true"
+    )
+    return data.get("repositories", [])
+
+
 # ---------------------------------------------------------------------------
 # gRPC-Web transport (File Service)
 # ---------------------------------------------------------------------------
@@ -166,7 +234,7 @@ def extract_json(response_text: str) -> Any:
 
 def build_source_root(ref: str = "refs/heads/main") -> list[Any]:
     return [
-        [None, "chromium/src", None, None, "chromium"],
+        [None, REPO, None, None, PROJECT],
         None,
         ref,
         ref,
@@ -219,13 +287,8 @@ def build_suggest_payload(
         "suggestOptions": {
             "enableDiagnostics": False,
             "maxSuggestions": max_suggestions,
-            "pathPrefix": "",
-            "repositoryScope": {
-                "root": {
-                    "ossProject": "chromium",
-                    "repositoryName": "chromium/src",
-                },
-            },
+            "pathPrefix": PATH_PREFIX,
+            "repositoryScope": repository_scope(),
             "retrieveMultibranchResults": True,
             "savedQuery": "",
             "showPersonalizedResults": False,
@@ -288,8 +351,12 @@ def fetch_file_contents(
     ]
     try:
         response = fetch_grpc_web(key, body, timeout)
-    except Exception as exc:
-        raise RuntimeError(f"File not found: {path} at {ref}") from exc
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(f"File not found: {path} at {ref}") from exc
+        raise RuntimeError(f"Request failed ({exc.code} {exc.reason})") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
     try:
         content = response[0][0][1][2]
     except (IndexError, TypeError) as exc:
@@ -297,6 +364,35 @@ def fetch_file_contents(
     if not isinstance(content, str):
         raise RuntimeError(f"No content returned for {path} at {ref}")
     return content.split("\n")
+
+
+ENTRY_TYPES = {1: "file", 3: "dir", 5: "submodule", 6: "symlink"}
+
+
+def fetch_directory(
+    path: str, ref: str = "refs/heads/main", timeout: float = 15.0
+) -> list[tuple[str, str]]:
+    """Return (name, type) for each immediate child of a directory."""
+    key = os.environ.get("CR_SEARCH_API_KEY", DEFAULT_API_KEY)
+    path = path.strip("/")
+    try:
+        response = fetch_grpc_web(key, [[build_source_root(ref), path], 1], timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(f"Directory not found: {path or '/'} at {ref}") from exc
+        raise RuntimeError(f"Request failed ({exc.code} {exc.reason})") from exc
+    try:
+        entries = response[0][0][0][0]
+    except (IndexError, TypeError) as exc:
+        raise RuntimeError(f"Not a directory: {path}") from exc
+    out = [
+        (e[0].rsplit("/", 1)[-1], ENTRY_TYPES.get(e[4], "other"))
+        for e in entries
+        if isinstance(e, list) and len(e) > 4
+    ]
+    if len(out) == 1 and out[0][1] == "file" and entries[0][0] == path:
+        raise RuntimeError(f"Not a directory: {path} (use cat)")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -471,11 +567,13 @@ class Spinner:
 # Formatting
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://source.chromium.org/chromium/chromium/src/+/main:"
+
+def file_url(path: str) -> str:
+    return f"https://source.chromium.org/{PROJECT}/{REPO}/+/main:{path}"
 
 
 def line_url(path: str, line: int) -> str:
-    return f"{BASE_URL}{path};l={line}"
+    return f"{file_url(path)};l={line}"
 
 
 def highlight_line(line: SnippetLine) -> str:
@@ -812,21 +910,28 @@ def run_search(
 # ---------------------------------------------------------------------------
 
 
-def run_find(query: str, *, no_color: bool = False) -> None:
+def _write_json(data: Any) -> None:
+    sys.stdout.write(json.dumps(data, indent=2) + "\n")
+
+
+def run_find(
+    query: str, *, limit: int = 10, as_json: bool = False, no_color: bool = False
+) -> None:
     if no_color:
         set_no_color(True)
     key = os.environ.get("CR_SEARCH_API_KEY", DEFAULT_API_KEY)
     spinner = Spinner("Finding...").start()
     try:
-        payload = build_suggest_payload(query)
+        payload = build_suggest_payload(query, max_suggestions=limit)
         paths = fetch_suggest(key, payload, timeout=15.0)
     finally:
         spinner.stop()
+    if as_json:
+        _write_json([{"path": p, "url": file_url(p)} for p in paths])
+    for p in paths if not as_json else []:
+        sys.stdout.write(p + "\n")
     if not paths:
         sys.stderr.write("No results found\n")
-        return
-    for p in paths:
-        sys.stdout.write(p + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -839,17 +944,96 @@ def run_cat(
     *,
     ref: str = "refs/heads/main",
     number_lines: bool = False,
+    as_json: bool = False,
 ) -> None:
     spinner = Spinner("Fetching...").start()
     try:
         lines = fetch_file_contents(path, ref=ref)
     finally:
         spinner.stop()
+    if as_json:
+        _write_json({"path": path, "ref": ref, "content": "\n".join(lines)})
+        return
     for i, line in enumerate(lines, 1):
         if number_lines:
             sys.stdout.write(f"{i:6}\t{line}\n")
         else:
             sys.stdout.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# ls / log / repos commands
+# ---------------------------------------------------------------------------
+
+
+def run_ls(path: str, *, ref: str = "refs/heads/main", as_json: bool = False) -> None:
+    spinner = Spinner("Listing...").start()
+    try:
+        entries = fetch_directory(path, ref=ref)
+    finally:
+        spinner.stop()
+    entries.sort(key=lambda e: (e[1] != "dir", e[0]))
+    if as_json:
+        _write_json([{"name": n, "type": t} for n, t in entries])
+        return
+    for name, kind in entries:
+        if kind == "dir":
+            sys.stdout.write(style(name + "/", "bold", "cyan") + "\n")
+        elif kind in ("submodule", "symlink"):
+            sys.stdout.write(f"{name}  {style('(' + kind + ')', 'dim')}\n")
+        else:
+            sys.stdout.write(name + "\n")
+
+
+def run_log(
+    path: str, *, ref: str = "refs/heads/main", limit: int = 10, as_json: bool = False
+) -> None:
+    spinner = Spinner("Fetching history...").start()
+    try:
+        entries = fetch_history(path, ref, limit)
+    finally:
+        spinner.stop()
+    rows = [
+        {
+            "commit": e.get("commitId", ""),
+            "time": e.get("commitTime", ""),
+            "author": e.get("author", {}).get("name", ""),
+            "subject": e.get("commitMessage", "").split("\n", 1)[0],
+            "position": e.get("metadata", {}).get("Cr-Commit-Position", ""),
+            "review": e.get("metadata", {}).get("Reviewed-on", ""),
+        }
+        for e in entries[:limit]
+    ]
+    if as_json:
+        _write_json(rows)
+        return
+    if not rows:
+        sys.stderr.write("No history found\n")
+        return
+    for r in rows:
+        date = r["time"][:10]
+        sys.stdout.write(
+            f"{style(r['commit'][:12], 'yellow')} {date} "
+            f"{style(r['author'], 'dim')}  {r['subject']}\n"
+        )
+
+
+def run_repos(*, as_json: bool = False) -> None:
+    repos = fetch_repositories()
+    rows = [
+        {
+            "name": r.get("name", ""),
+            "semantic": bool(r.get("hasSemanticIndex")),
+            "lastCommit": r.get("lastCommitTime", "")[:19],
+        }
+        for r in repos
+    ]
+    if as_json:
+        _write_json(rows)
+        return
+    for r in rows:
+        flag = " (xrefs)" if r["semantic"] else ""
+        sys.stdout.write(f"{r['name']}{style(flag, 'dim')}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -864,17 +1048,27 @@ Commands:
   search <query>   Search Chromium source code
   find <name>      Find files by name
   cat <path>       Print file contents
+  ls [path]        List a directory
+  log <path>       Commit history for a file or directory
+  repos            List repositories in the project
   syntax           Print query syntax reference
   <query>          Implicit search (no subcommand needed)
 
 Flags (search):
-  -L, --limit <n>         Max results (default: 30)
+  -L, --limit <n>         Max results (default: 30; find: 10; log: 10)
   -C, --context <n>       Context lines around matches (default: 0)
       --json [fields]     JSON output (fields: path,line,snippet,context,url)
+                          find/cat/ls/log/repos: --json takes no fields
 
-Flags (cat):
-      --ref <ref>         Git ref (default: refs/heads/main)
-  -n                      Number output lines
+Flags (cat, ls, log):
+      --ref <ref>         Git ref (default: refs/heads/main). search and find
+                          always use the current main index.
+  -n                      Number output lines (cat)
+
+Flags (scope):
+      --project <name>    Code search project (default: chromium; env CR_SEARCH_PROJECT)
+      --repo <name>       Repository (default: chromium/src; env CR_SEARCH_REPO)
+      --path <prefix>     Limit search/find to a directory prefix
 
 Flags (all):
       --no-color          Disable colored output
@@ -886,10 +1080,14 @@ Examples:
   chromium-search 'usage:TabStripModel -file:out/' -C 3
   chromium-search 'file:*_test.cc base::span' -L 10
   chromium-search 'function:CreateForTesting lang:cpp' --json
-  chromium-search find web_contents.h
+  chromium-search ScrollEnd --path third_party/blink/renderer/core
+  chromium-search gclient_eval --repo chromium/tools/depot_tools
+  chromium-search find web_contents.h -L 20
   chromium-search cat content/public/browser/web_contents.h
   chromium-search cat chrome/browser/BUILD.gn --ref refs/tags/144.0.7559.98
-  chromium-search cat base/containers/span.h -n
+  chromium-search ls third_party/crossbench
+  chromium-search log base/containers/span.h -L 5
+  chromium-search repos
   chromium-search syntax
 """
 
@@ -901,86 +1099,89 @@ def main() -> None:
         add_help=False,
     )
     parser.add_argument("args", nargs="*", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "-L", "--limit", type=int, default=30, help="Max results (default: 30)"
-    )
-    parser.add_argument(
-        "-C",
-        "--context",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Context lines around matches (default: 0)",
-    )
-    parser.add_argument(
-        "--json",
-        nargs="?",
-        const="",
-        default=None,
-        dest="json_fields",
-        metavar="fields",
-        help="JSON output (fields: path,line,snippet,context,matchRanges,url)",
-    )
-    parser.add_argument(
-        "--ref", default="refs/heads/main", help="Git ref (default: refs/heads/main)"
-    )
-    parser.add_argument(
-        "-n", "--number", action="store_true", help="Number output lines"
-    )
-    parser.add_argument(
-        "--no-color", action="store_true", help="Disable colored output"
-    )
-    parser.add_argument("-h", "--help", action="store_true", help="Show this help")
+    parser.add_argument("-L", "--limit", type=int, default=None)
+    parser.add_argument("-C", "--context", type=int, default=0, metavar="N")
+    parser.add_argument("--json", nargs="?", const="", default=None, dest="json_fields")
+    parser.add_argument("--ref", default=None)
+    parser.add_argument("-n", "--number", action="store_true")
+    parser.add_argument("--project", default=PROJECT)
+    parser.add_argument("--repo", default=REPO)
+    parser.add_argument("--path", default="")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
     opts = parser.parse_args()
 
     if opts.help:
         sys.stderr.write(USAGE)
         return
 
+    if opts.no_color:
+        set_no_color(True)
+    set_scope(opts.project, opts.repo, opts.path)
+    as_json = opts.json_fields is not None
+    ref = opts.ref or "refs/heads/main"
+
     positionals: list[str] = opts.args
     subcommand = positionals[0] if positionals else ""
+    rest = " ".join(positionals[1:])
 
     if subcommand == "syntax":
         sys.stdout.write(SYNTAX_REFERENCE)
         return
 
+    if subcommand == "repos":
+        run_repos(as_json=as_json)
+        return
+
+    if subcommand == "ls":
+        run_ls(rest, ref=ref, as_json=as_json)
+        return
+
+    if subcommand == "log":
+        if not rest:
+            sys.stderr.write("Usage: chromium-search log <path> [--ref <ref>] [-L n]\n")
+            sys.exit(1)
+        run_log(rest, ref=ref, limit=opts.limit or 10, as_json=as_json)
+        return
+
     if subcommand == "cat":
-        path = " ".join(positionals[1:])
-        if not path:
+        if not rest:
             sys.stderr.write("Usage: chromium-search cat <path> [--ref <ref>] [-n]\n")
             sys.exit(1)
-        run_cat(path, ref=opts.ref, number_lines=opts.number)
+        run_cat(rest, ref=ref, number_lines=opts.number, as_json=as_json)
         return
+
+    if opts.ref:
+        sys.stderr.write(
+            "note: --ref only applies to cat/ls/log; "
+            "search and find use the current main index\n"
+        )
 
     if subcommand == "find":
-        query = " ".join(positionals[1:])
-        if not query:
-            sys.stderr.write("Usage: chromium-search find <name>\n")
+        if not rest:
+            sys.stderr.write("Usage: chromium-search find <name> [-L n]\n")
             sys.exit(1)
-        run_find(query, no_color=opts.no_color)
+        run_find(rest, limit=opts.limit or 10, as_json=as_json)
         return
 
-    if subcommand == "search":
-        query = " ".join(positionals[1:])
-    else:
-        query = " ".join(positionals)
-
+    query = rest if subcommand == "search" else " ".join(positionals)
     if not query:
         sys.stderr.write(USAGE)
         sys.exit(1)
 
     run_search(
         query,
-        limit=opts.limit,
+        limit=opts.limit or 30,
         context_lines=opts.context,
         json_fields=opts.json_fields,
-        no_color=opts.no_color,
     )
 
 
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        sys.exit(130)
     except Exception as exc:
         sys.stderr.write(f"Error: {exc}\n")
         sys.exit(1)
